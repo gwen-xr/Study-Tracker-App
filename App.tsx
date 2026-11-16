@@ -11,12 +11,14 @@ import {
   Alert,
   SafeAreaView,
   Platform,
+  ActivityIndicator,
 } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { Ionicons } from '@expo/vector-icons';
 import * as Notifications from 'expo-notifications';
 import * as DocumentPicker from 'expo-document-picker';
+import * as ImagePicker from 'expo-image-picker';
 import * as FileSystem from 'expo-file-system/legacy';
 import * as Sharing from 'expo-sharing';
 import AsyncStorage from '@react-native-async-storage/async-storage';
@@ -87,6 +89,7 @@ interface ResourceItem {
   contentOrStatus: string;
   pdfUri?: string;
   pdfName?: string;
+  isRevised?: boolean;
 }
 
 interface Module {
@@ -94,7 +97,9 @@ interface Module {
   code: string;
   name: string;
   credits: number; // Academic Units (AU)
-  manualGrade?: string; // Optional override e.g. 'A-' or 'Auto'
+  manualGrade?: string;
+  totalChapters: number;
+  completedChapters: number[]; // Array of completed chapter numbers e.g. [1, 2, 3]
   gradedItems: GradedItem[];
   resources: ResourceItem[];
 }
@@ -116,12 +121,14 @@ const INITIAL_MODULES: Module[] = [
     name: 'Data Structures & Algorithms',
     credits: 4,
     manualGrade: 'Auto',
+    totalChapters: 10,
+    completedChapters: [1, 2, 3],
     gradedItems: [
       { id: 'g1', name: 'Problem Set 1', weight: 15, score: 14, maxScore: 15 },
       { id: 'g2', name: 'Midterm Exam', weight: 35, score: 78, maxScore: 100 },
     ],
     resources: [
-      { id: 'r1', type: 'Note', title: 'Week 3: AVL Trees', contentOrStatus: 'Balance factor must stay between -1 and 1. Rotations take O(1).' },
+      { id: 'r1', type: 'Note', title: 'Chapter 3: AVL Trees', contentOrStatus: 'Balance factor must stay between -1 and 1. Rotations take O(1).' },
       { id: 'r2', type: 'Tutorial', title: 'Tutorial 4: Hashing', contentOrStatus: 'Mastered' },
       { id: 'r3', type: 'PYP', title: 'AY24/25 Sem 1 Finals', contentOrStatus: 'Needs Review' },
     ],
@@ -132,11 +139,13 @@ const INITIAL_MODULES: Module[] = [
     name: 'Calculus for Computing',
     credits: 4,
     manualGrade: 'Auto',
+    totalChapters: 8,
+    completedChapters: [1, 2],
     gradedItems: [
       { id: 'g3', name: 'Quiz 1', weight: 20, score: 18, maxScore: 20 },
     ],
     resources: [
-      { id: 'r4', type: 'Note', title: 'Taylor Series', contentOrStatus: 'Remember remainder term estimation for error bounds.' },
+      { id: 'r4', type: 'Note', title: 'Chapter 2: Taylor Series', contentOrStatus: 'Remember remainder term estimation for error bounds.' },
       { id: 'r5', type: 'PYP', title: 'AY23/24 Sem 2 Finals', contentOrStatus: 'Unattempted' },
     ],
   },
@@ -180,6 +189,7 @@ export default function App() {
   const [calendarBlocks, setCalendarBlocks] = useState<CalendarBlock[]>(INITIAL_BLOCKS);
   const [globalBaitMode, setGlobalBaitMode] = useState<boolean>(true);
   const [revealedTaskIds, setRevealedTaskIds] = useState<Record<string, boolean>>({});
+  const [cgpaModalVisible, setCgpaModalVisible] = useState<boolean>(false);
 
   useEffect(() => {
     (async () => {
@@ -187,10 +197,19 @@ export default function App() {
       if (status !== 'granted') {
         Alert.alert('Permission needed', 'Enable notifications to get status check-ins and deadline alerts.');
       }
-      const saved = await AsyncStorage.getItem('@study_tracker_v3');
+      const saved = await AsyncStorage.getItem('@study_tracker_v4');
       if (saved) {
         const parsed = JSON.parse(saved);
-        setModules(parsed.modules || INITIAL_MODULES);
+        if (parsed.modules) {
+          // Ensure backward compatibility with chapter fields
+          setModules(
+            parsed.modules.map((m: Module) => ({
+              ...m,
+              totalChapters: m.totalChapters ?? 8,
+              completedChapters: m.completedChapters ?? [],
+            }))
+          );
+        }
         setTasks(parsed.tasks || INITIAL_TASKS);
         setCalendarBlocks(parsed.calendarBlocks || INITIAL_BLOCKS);
         setGlobalBaitMode(parsed.globalBaitMode ?? true);
@@ -200,10 +219,66 @@ export default function App() {
 
   useEffect(() => {
     AsyncStorage.setItem(
-      '@study_tracker_v3',
+      '@study_tracker_v4',
       JSON.stringify({ modules, tasks, calendarBlocks, globalBaitMode })
     );
   }, [modules, tasks, calendarBlocks, globalBaitMode]);
+
+  // Shared GPA calculation helper
+  const calculateStats = (mod: Module) => {
+    let earnedWeight = 0;
+    let totalWeight = 0;
+    mod.gradedItems.forEach((item) => {
+      totalWeight += item.weight;
+      earnedWeight += (item.score / item.maxScore) * item.weight;
+    });
+    const currentPct = totalWeight > 0 ? (earnedWeight / totalWeight) * 100 : 0;
+
+    const autoLetter =
+      currentPct >= 85
+        ? 'A+'
+        : currentPct >= 80
+        ? 'A'
+        : currentPct >= 75
+        ? 'A-'
+        : currentPct >= 70
+        ? 'B+'
+        : currentPct >= 65
+        ? 'B'
+        : currentPct >= 60
+        ? 'B-'
+        : currentPct >= 55
+        ? 'C+'
+        : currentPct >= 50
+        ? 'C'
+        : 'D';
+
+    const effectiveLetter =
+      mod.manualGrade && mod.manualGrade !== 'Auto' ? mod.manualGrade : autoLetter;
+    const gpaPoint = GRADE_POINTS[effectiveLetter] ?? 4.0;
+
+    return {
+      earnedWeight: earnedWeight.toFixed(1),
+      totalWeight,
+      currentPct: currentPct.toFixed(1),
+      effectiveLetter,
+      gpaPoint,
+    };
+  };
+
+  const { cumulativeGPA, totalAUs } = useMemo(() => {
+    let totalPoints = 0;
+    let totalCredits = 0;
+    modules.forEach((m) => {
+      const { gpaPoint } = calculateStats(m);
+      totalPoints += gpaPoint * m.credits;
+      totalCredits += m.credits;
+    });
+    return {
+      cumulativeGPA: totalCredits > 0 ? (totalPoints / totalCredits).toFixed(2) : '0.00',
+      totalAUs: totalCredits,
+    };
+  }, [modules]);
 
   const getEffectiveDueDate = (task: Task) => {
     const actual = new Date(task.actualDueDate);
@@ -428,7 +503,7 @@ export default function App() {
     );
   };
 
-  // --- SCREEN 2: INTERACTIVE TIME-BLOCKING CALENDAR & TIMETABLE IMPORT ---
+  // --- SCREEN 2: INTERACTIVE TIME-BLOCKING CALENDAR & SCREENSHOT / .ICS IMPORT ---
   const CalendarScreen = () => {
     const [selectedDay, setSelectedDay] = useState('Mon');
     const [blockModal, setBlockModal] = useState(false);
@@ -436,6 +511,7 @@ export default function App() {
     const [start, setStart] = useState('14:00');
     const [durationHours, setDurationHours] = useState<number>(1);
     const [type, setType] = useState<'Study' | 'Personal' | 'Class'>('Study');
+    const [isScanningImage, setIsScanningImage] = useState(false);
 
     const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
@@ -452,6 +528,103 @@ export default function App() {
       setTitle('');
       setType('Study');
       setBlockModal(true);
+    };
+
+    // Parse OCR text extracted from timetable screenshot (JPG/PNG)
+    const parseTimetableText = (rawText: string): CalendarBlock[] => {
+      const blocks: CalendarBlock[] = [];
+      const dayRegex = /\b(Mon|Monday|Tue|Tuesday|Wed|Wednesday|Thu|Thursday|Fri|Friday|Sat|Saturday)\b/gi;
+      const timeRangeRegex = /(\d{1,2})[:.](\d{2})\s*[-–to]+\s*(\d{1,2})[:.](\d{2})/gi;
+      const codeRegex = /\b([A-Z]{2,4}\d{4}[A-Z]?)\b/g;
+
+      const lines = rawText.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+      let currentDay = 'Mon';
+
+      lines.forEach((line, idx) => {
+        const dayMatch = line.match(dayRegex);
+        if (dayMatch) {
+          const short = dayMatch[0].slice(0, 3);
+          currentDay = short.charAt(0).toUpperCase() + short.slice(1).toLowerCase();
+        }
+
+        const timeMatch = [...line.matchAll(timeRangeRegex)][0];
+        if (timeMatch) {
+          const sH = timeMatch[1].padStart(2, '0');
+          const sM = timeMatch[2];
+          const eH = timeMatch[3].padStart(2, '0');
+          const eM = timeMatch[4];
+          const codeMatch = line.match(codeRegex);
+          const label = codeMatch
+            ? `${codeMatch[0]} Class`
+            : line.replace(timeRangeRegex, '').replace(dayRegex, '').trim() || `Class ${idx + 1}`;
+
+          blocks.push({
+            id: `img-${Date.now()}-${idx}`,
+            title: label.slice(0, 32),
+            day: currentDay,
+            startTime: `${sH}:${sM}`,
+            endTime: `${eH}:${eM}`,
+            type: 'Class',
+          });
+        }
+      });
+
+      return blocks;
+    };
+
+    // Upload Timetable Screenshot (JPG or PNG) & Read via OCR
+    const handleImportScreenshot = async () => {
+      try {
+        const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
+        if (!perm.granted) {
+          Alert.alert('Permission Required', 'Allow photo library access to upload your timetable screenshot.');
+          return;
+        }
+
+        const result = await ImagePicker.launchImageLibraryAsync({
+          mediaTypes: ['images'],
+          quality: 0.7,
+          base64: true,
+        });
+
+        if (result.canceled || !result.assets[0]) return;
+        const asset = result.assets[0];
+
+        setIsScanningImage(true);
+        const mime = asset.uri.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg';
+        const formData = new FormData();
+        formData.append('base64Image', `data:${mime};base64,${asset.base64}`);
+        formData.append('language', 'eng');
+        formData.append('isTable', 'true');
+
+        const response = await fetch('https://api.ocr.space/parse/image', {
+          method: 'POST',
+          headers: { apikey: 'helloworld' },
+          body: formData,
+        });
+        const json = await response.json();
+        setIsScanningImage(false);
+
+        const parsedText: string = json?.ParsedResults?.[0]?.ParsedText || '';
+        const extractedBlocks = parseTimetableText(parsedText);
+
+        if (extractedBlocks.length > 0) {
+          setCalendarBlocks((prev) => [...prev, ...extractedBlocks]);
+          Alert.alert(
+            'Timetable Screenshot Read!',
+            `Detected and added ${extractedBlocks.length} class slots from your image.`
+          );
+        } else {
+          Alert.alert(
+            'Screenshot Scanned',
+            'Could not auto-detect standard "Mon 10:00-12:00" text patterns in this screenshot. Opening manual slot blocker so you can add classes quickly.',
+            [{ text: 'Add Class Manually', onPress: () => { setType('Class'); setBlockModal(true); } }]
+          );
+        }
+      } catch (err) {
+        setIsScanningImage(false);
+        Alert.alert('Scan Error', 'Could not process the screenshot. Please check your internet connection or add blocks manually.');
+      }
     };
 
     const handleImportICS = async () => {
@@ -544,16 +717,41 @@ export default function App() {
       <SafeAreaView style={styles.container}>
         <View style={styles.headerRow}>
           <Text style={styles.headerTitle}>Schedule</Text>
-          <View style={{ flexDirection: 'row', gap: 8 }}>
-            <TouchableOpacity style={[styles.secondaryBtn, { marginTop: 0 }]} onPress={handleImportICS}>
-              <Text style={styles.secondaryBtnText}>Import .ics</Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={styles.primaryBtn} onPress={() => openSlotPicker('14:00')}>
-              <Text style={styles.primaryBtnText}>+ Block Time</Text>
-            </TouchableOpacity>
-          </View>
+          <TouchableOpacity style={styles.primaryBtn} onPress={() => openSlotPicker('14:00')}>
+            <Text style={styles.primaryBtnText}>+ Block Time</Text>
+          </TouchableOpacity>
         </View>
 
+        {/* Timetable Import Bar: Screenshot (JPG/PNG) or .ICS */}
+        <View style={[styles.rowBetween, { marginBottom: 10, gap: 8 }]}>
+          <TouchableOpacity
+            style={[styles.secondaryBtn, { flex: 1, marginTop: 0, justifyContent: 'center' }]}
+            onPress={handleImportScreenshot}
+            disabled={isScanningImage}
+          >
+            <Ionicons name="image-outline" size={16} color={THEME.primary} />
+            <Text style={styles.secondaryBtnText}>
+              {isScanningImage ? 'Reading Screenshot...' : 'Upload Timetable (JPG/PNG)'}
+            </Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            style={[styles.secondaryBtn, { marginTop: 0 }]}
+            onPress={handleImportICS}
+          >
+            <Ionicons name="calendar-outline" size={16} color={THEME.primary} />
+            <Text style={styles.secondaryBtnText}>.ics</Text>
+          </TouchableOpacity>
+        </View>
+
+        {isScanningImage && (
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+            <ActivityIndicator size="small" color={THEME.primary} />
+            <Text style={styles.helperHint}>Scanning timetable image for classes & times...</Text>
+          </View>
+        )}
+
+        {/* Day Selector */}
         <View style={styles.dayBar}>
           {days.map((d) => (
             <TouchableOpacity
@@ -693,17 +891,10 @@ export default function App() {
     );
   };
 
-  // --- SCREEN 3: MODULES HUB (CGPA TRANSCRIPT TABLE, PDF UPLOADS, GRADES, NOTES, TUTORIALS/PYPs) ---
+  // --- SCREEN 3: MODULES HUB (CHAPTER PROGRESS BAR, CGPA TABLE, PDF UPLOADS, GRADES, TUTORIALS/PYPs) ---
   const ModulesScreen = () => {
     const [activeModId, setActiveModId] = useState<string>(modules[0]?.id || 'm1');
-    const [subTab, setSubTab] = useState<'Grades' | 'Notes' | 'Tutorials/PYP'>('Notes');
-
-    // cGPA Transcript Modal & Add Module inputs
-    const [cgpaModalVisible, setCgpaModalVisible] = useState(false);
-    const [newModCode, setNewModCode] = useState('');
-    const [newModName, setNewModName] = useState('');
-    const [newModAU, setNewModAU] = useState('4');
-    const [newModGrade, setNewModGrade] = useState('Auto');
+    const [subTab, setSubTab] = useState<'Notes' | 'Grades' | 'Tutorials/PYP'>('Notes');
 
     // Add Graded Item inputs
     const [gName, setGName] = useState('');
@@ -719,108 +910,34 @@ export default function App() {
 
     const activeMod = modules.find((m) => m.id === activeModId) || modules[0];
 
-    // Calculate Module Percentage, Letter Grade, and 5.0 Grade Point
-    const calculateStats = (mod: Module) => {
-      let earnedWeight = 0;
-      let totalWeight = 0;
-      mod.gradedItems.forEach((item) => {
-        totalWeight += item.weight;
-        earnedWeight += (item.score / item.maxScore) * item.weight;
-      });
-      const currentPct = totalWeight > 0 ? (earnedWeight / totalWeight) * 100 : 0;
-
-      // Auto-derived letter grade from percentage
-      const autoLetter =
-        currentPct >= 85
-          ? 'A+'
-          : currentPct >= 80
-          ? 'A'
-          : currentPct >= 75
-          ? 'A-'
-          : currentPct >= 70
-          ? 'B+'
-          : currentPct >= 65
-          ? 'B'
-          : currentPct >= 60
-          ? 'B-'
-          : currentPct >= 55
-          ? 'C+'
-          : currentPct >= 50
-          ? 'C'
-          : 'D';
-
-      const effectiveLetter =
-        mod.manualGrade && mod.manualGrade !== 'Auto' ? mod.manualGrade : autoLetter;
-      const gpaPoint = GRADE_POINTS[effectiveLetter] ?? 4.0;
-
-      return {
-        earnedWeight: earnedWeight.toFixed(1),
-        totalWeight,
-        currentPct: currentPct.toFixed(1),
-        effectiveLetter,
-        gpaPoint,
-      };
-    };
-
-    // Cumulative GPA & Total AUs across all modules
-    const { cumulativeGPA, totalAUs } = useMemo(() => {
-      let totalPoints = 0;
-      let totalCredits = 0;
-      modules.forEach((m) => {
-        const { gpaPoint } = calculateStats(m);
-        totalPoints += gpaPoint * m.credits;
-        totalCredits += m.credits;
-      });
-      return {
-        cumulativeGPA: totalCredits > 0 ? (totalPoints / totalCredits).toFixed(2) : '0.00',
-        totalAUs: totalCredits,
-      };
-    }, [modules]);
-
-    // Add new module to cGPA table
-    const addNewModule = () => {
-      if (!newModCode.trim()) return;
-      const created: Module = {
-        id: `m-${Date.now()}`,
-        code: newModCode.trim().toUpperCase(),
-        name: newModName.trim() || 'University Module',
-        credits: parseInt(newModAU, 10) || 4,
-        manualGrade: newModGrade,
-        gradedItems: [],
-        resources: [],
-      };
-      setModules((prev) => [...prev, created]);
-      setActiveModId(created.id);
-      setNewModCode('');
-      setNewModName('');
-      setNewModAU('4');
-      setNewModGrade('Auto');
-    };
-
-    const cycleModuleGrade = (modId: string) => {
+    // Chapter Progress Bar Controls
+    const updateTotalChapters = (delta: number) => {
       setModules((prev) =>
         prev.map((m) => {
-          if (m.id !== modId) return m;
-          const current = m.manualGrade || 'Auto';
-          const next = GRADE_OPTIONS[(GRADE_OPTIONS.indexOf(current) + 1) % GRADE_OPTIONS.length];
-          return { ...m, manualGrade: next };
+          if (m.id !== activeMod.id) return m;
+          const nextTotal = Math.max(1, Math.min(30, (m.totalChapters || 8) + delta));
+          return {
+            ...m,
+            totalChapters: nextTotal,
+            completedChapters: m.completedChapters.filter((c) => c <= nextTotal),
+          };
         })
       );
     };
 
-    const deleteModule = (modId: string) => {
-      if (modules.length <= 1) {
-        Alert.alert('Cannot Delete', 'Keep at least one module in your tracker.');
-        return;
-      }
-      setModules((prev) => {
-        const filtered = prev.filter((m) => m.id !== modId);
-        if (activeModId === modId) setActiveModId(filtered[0].id);
-        return filtered;
-      });
+    const toggleChapterCompleted = (chapterNum: number) => {
+      setModules((prev) =>
+        prev.map((m) => {
+          if (m.id !== activeMod.id) return m;
+          const exists = m.completedChapters.includes(chapterNum);
+          const updated = exists
+            ? m.completedChapters.filter((c) => c !== chapterNum)
+            : [...m.completedChapters, chapterNum].sort((a, b) => a - b);
+          return { ...m, completedChapters: updated };
+        })
+      );
     };
 
-    // Pick PDF file from phone storage/iCloud/Drive
     const handlePickPDF = async () => {
       try {
         const res = await DocumentPicker.getDocumentAsync({
@@ -830,7 +947,6 @@ export default function App() {
         if (res.canceled) return;
         const asset = res.assets[0];
 
-        // Persist inside app documentDirectory so it stays available across restarts
         const safeName = `${Date.now()}_${asset.name.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
         const destUri = `${FileSystem.documentDirectory}${safeName}`;
         await FileSystem.copyAsync({ from: asset.uri, to: destUri });
@@ -844,7 +960,6 @@ export default function App() {
       }
     };
 
-    // Open uploaded PDF using native iOS/Android viewer sheet
     const openAttachedPDF = async (uri?: string) => {
       if (!uri) return;
       try {
@@ -905,6 +1020,7 @@ export default function App() {
                         : 'Unattempted',
                     pdfUri: attachedPdf?.uri,
                     pdfName: attachedPdf?.name,
+                    isRevised: false,
                   },
                 ],
               }
@@ -914,6 +1030,21 @@ export default function App() {
       setResTitle('');
       setResBody('');
       setAttachedPdf(null);
+    };
+
+    const toggleNoteRevised = (resId: string) => {
+      setModules((prev) =>
+        prev.map((m) =>
+          m.id === activeMod.id
+            ? {
+                ...m,
+                resources: m.resources.map((r) =>
+                  r.id === resId ? { ...r, isRevised: !r.isRevised } : r
+                ),
+              }
+            : m
+        )
+      );
     };
 
     const setPracticeStatus = (resId: string, newStatus: RevisionStatus) => {
@@ -942,16 +1073,19 @@ export default function App() {
     };
 
     const stats = calculateStats(activeMod);
+    const totalCh = activeMod.totalChapters || 8;
+    const doneChCount = activeMod.completedChapters.length;
+    const chapterPct = Math.round((doneChCount / totalCh) * 100);
 
     return (
       <SafeAreaView style={styles.container}>
         <View style={styles.headerRow}>
           <Text style={styles.headerTitle}>Modules Hub</Text>
-          {/* Tappable cGPA Pill */}
+          {/* Tappable cGPA Pill -> Opens Module | Academic Unit | Grade Table */}
           <TouchableOpacity
             style={styles.gpaBadge}
             onPress={() => setCgpaModalVisible(true)}
-            activeOpacity={0.8}
+            activeOpacity={0.75}
           >
             <Text style={styles.gpaBadgeText}>cGPA: {cumulativeGPA} / 5.0 ▾</Text>
           </TouchableOpacity>
@@ -973,7 +1107,7 @@ export default function App() {
             style={[styles.chip, { borderWidth: 1, borderStyle: 'dashed', borderColor: THEME.primary }]}
             onPress={() => setCgpaModalVisible(true)}
           >
-            <Text style={styles.chipText}>+ Mod / Table</Text>
+            <Text style={styles.chipText}>+ Add Mod / cGPA Table</Text>
           </TouchableOpacity>
         </ScrollView>
 
@@ -987,7 +1121,7 @@ export default function App() {
         </View>
 
         <View style={styles.subTabRow}>
-          {(['Grades', 'Notes', 'Tutorials/PYP'] as const).map((tab) => (
+          {(['Notes', 'Grades', 'Tutorials/PYP'] as const).map((tab) => (
             <TouchableOpacity
               key={tab}
               style={[styles.subTab, subTab === tab && styles.subTabActive]}
@@ -1004,6 +1138,137 @@ export default function App() {
         </View>
 
         <ScrollView contentContainerStyle={{ paddingBottom: 40 }}>
+          {subTab === 'Notes' && (
+            <>
+              {/* CHAPTER REVISION PROGRESS BAR CARD */}
+              <View style={styles.card}>
+                <View style={styles.rowBetween}>
+                  <Text style={styles.label}>Chapter Revision Progress</Text>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                    <Text style={{ fontSize: 12, color: THEME.textMuted, fontWeight: '600' }}>Total:</Text>
+                    <TouchableOpacity style={styles.stepperBtn} onPress={() => updateTotalChapters(-1)}>
+                      <Text style={styles.stepperBtnText}>-</Text>
+                    </TouchableOpacity>
+                    <Text style={{ fontSize: 14, fontWeight: '800', color: THEME.primary }}>{totalCh}</Text>
+                    <TouchableOpacity style={styles.stepperBtn} onPress={() => updateTotalChapters(1)}>
+                      <Text style={styles.stepperBtnText}>+</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+
+                {/* Progress Bar Track & Fill */}
+                <View style={styles.progressTrack}>
+                  <View style={[styles.progressFill, { width: `${chapterPct}%` }]} />
+                </View>
+                <View style={styles.rowBetween}>
+                  <Text style={styles.dueText}>
+                    {doneChCount} of {totalCh} chapters revised
+                  </Text>
+                  <Text style={{ fontSize: 13, fontWeight: '800', color: THEME.primary }}>
+                    {chapterPct}%
+                  </Text>
+                </View>
+
+                {/* Tappable Chapter Pills */}
+                <Text style={[styles.helperHint, { marginTop: 8 }]}>
+                  Tap a chapter number when you finish revising it:
+                </Text>
+                <View style={styles.chapterGrid}>
+                  {Array.from({ length: totalCh }, (_, i) => i + 1).map((chNum) => {
+                    const isDone = activeMod.completedChapters.includes(chNum);
+                    return (
+                      <TouchableOpacity
+                        key={chNum}
+                        style={[styles.chapterPill, isDone && styles.chapterPillDone]}
+                        onPress={() => toggleChapterCompleted(chNum)}
+                      >
+                        <Text style={[styles.chapterPillText, isDone && { color: '#FFFFFF' }]}>
+                          Ch {chNum} {isDone ? '✓' : ''}
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </View>
+              </View>
+
+              {/* Saved Study Notes & PDFs */}
+              {activeMod.resources
+                .filter((r) => r.type === 'Note')
+                .map((note) => (
+                  <View key={note.id} style={styles.card}>
+                    <View style={styles.rowBetween}>
+                      <Text style={styles.taskTitle}>{note.title}</Text>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+                        <TouchableOpacity
+                          style={[
+                            styles.revisedMiniBtn,
+                            note.isRevised && { backgroundColor: '#2E6F40', borderColor: '#2E6F40' },
+                          ]}
+                          onPress={() => toggleNoteRevised(note.id)}
+                        >
+                          <Text
+                            style={{
+                              fontSize: 11,
+                              fontWeight: '700',
+                              color: note.isRevised ? '#FFFFFF' : THEME.primary,
+                            }}
+                          >
+                            {note.isRevised ? 'Revised ✓' : 'Mark Revised'}
+                          </Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity onPress={() => deleteResource(note.id)}>
+                          <Ionicons name="trash-outline" size={18} color={THEME.textMuted} />
+                        </TouchableOpacity>
+                      </View>
+                    </View>
+                    <Text style={styles.noteBody}>{note.contentOrStatus}</Text>
+
+                    {note.pdfUri && (
+                      <TouchableOpacity
+                        style={styles.pdfChipBtn}
+                        onPress={() => openAttachedPDF(note.pdfUri)}
+                      >
+                        <Ionicons name="document-text" size={16} color={THEME.primary} />
+                        <Text style={styles.pdfChipText} numberOfLines={1}>
+                          Open PDF: {note.pdfName || 'Lecture_Notes.pdf'}
+                        </Text>
+                      </TouchableOpacity>
+                    )}
+                  </View>
+                ))}
+
+              <View style={styles.card}>
+                <Text style={styles.label}>+ Add Chapter Note / Upload Lecture PDF</Text>
+                <TextInput
+                  style={styles.input}
+                  placeholder="Chapter / Topic Title (e.g. Chapter 4: Graphs)"
+                  placeholderTextColor={THEME.textMuted}
+                  value={resTitle}
+                  onChangeText={setResTitle}
+                />
+                <TextInput
+                  style={[styles.input, { height: 65 }]}
+                  multiline
+                  placeholder="Summary notes (optional if uploading PDF)..."
+                  placeholderTextColor={THEME.textMuted}
+                  value={resBody}
+                  onChangeText={setResBody}
+                />
+
+                <TouchableOpacity style={styles.uploadOutlineBtn} onPress={handlePickPDF}>
+                  <Ionicons name="cloud-upload-outline" size={18} color={THEME.primary} />
+                  <Text style={styles.uploadOutlineText}>
+                    {attachedPdf ? `Attached: ${attachedPdf.name}` : 'Upload Lecture Notes PDF'}
+                  </Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity style={styles.primaryBtn} onPress={() => addResource('Note')}>
+                  <Text style={styles.primaryBtnText}>Save Note & PDF</Text>
+                </TouchableOpacity>
+              </View>
+            </>
+          )}
+
           {subTab === 'Grades' && (
             <>
               {activeMod.gradedItems.map((g) => (
@@ -1055,66 +1320,6 @@ export default function App() {
                 </View>
                 <TouchableOpacity style={styles.primaryBtn} onPress={addGradedItem}>
                   <Text style={styles.primaryBtnText}>Add Graded Item</Text>
-                </TouchableOpacity>
-              </View>
-            </>
-          )}
-
-          {subTab === 'Notes' && (
-            <>
-              {activeMod.resources
-                .filter((r) => r.type === 'Note')
-                .map((note) => (
-                  <View key={note.id} style={styles.card}>
-                    <View style={styles.rowBetween}>
-                      <Text style={styles.taskTitle}>{note.title}</Text>
-                      <TouchableOpacity onPress={() => deleteResource(note.id)}>
-                        <Ionicons name="trash-outline" size={18} color={THEME.textMuted} />
-                      </TouchableOpacity>
-                    </View>
-                    <Text style={styles.noteBody}>{note.contentOrStatus}</Text>
-
-                    {note.pdfUri && (
-                      <TouchableOpacity
-                        style={styles.pdfChipBtn}
-                        onPress={() => openAttachedPDF(note.pdfUri)}
-                      >
-                        <Ionicons name="document-text" size={16} color={THEME.primary} />
-                        <Text style={styles.pdfChipText} numberOfLines={1}>
-                          Open PDF: {note.pdfName || 'Lecture_Notes.pdf'}
-                        </Text>
-                      </TouchableOpacity>
-                    )}
-                  </View>
-                ))}
-
-              <View style={styles.card}>
-                <Text style={styles.label}>+ Add Study Note / Upload Lecture PDF</Text>
-                <TextInput
-                  style={styles.input}
-                  placeholder="Lecture / Topic Title"
-                  placeholderTextColor={THEME.textMuted}
-                  value={resTitle}
-                  onChangeText={setResTitle}
-                />
-                <TextInput
-                  style={[styles.input, { height: 65 }]}
-                  multiline
-                  placeholder="Summary notes (optional if uploading PDF)..."
-                  placeholderTextColor={THEME.textMuted}
-                  value={resBody}
-                  onChangeText={setResBody}
-                />
-
-                <TouchableOpacity style={styles.uploadOutlineBtn} onPress={handlePickPDF}>
-                  <Ionicons name="cloud-upload-outline" size={18} color={THEME.primary} />
-                  <Text style={styles.uploadOutlineText}>
-                    {attachedPdf ? `Attached: ${attachedPdf.name}` : 'Upload Lecture Notes PDF'}
-                  </Text>
-                </TouchableOpacity>
-
-                <TouchableOpacity style={styles.primaryBtn} onPress={() => addResource('Note')}>
-                  <Text style={styles.primaryBtnText}>Save Note & PDF</Text>
                 </TouchableOpacity>
               </View>
             </>
@@ -1213,124 +1418,170 @@ export default function App() {
             </>
           )}
         </ScrollView>
+      </SafeAreaView>
+    );
+  };
 
-        {/* CGPA TRANSCRIPT TABLE MODAL */}
-        <Modal visible={cgpaModalVisible} animationType="slide" transparent>
-          <View style={styles.modalOverlay}>
-            <View style={[styles.modalBox, { maxHeight: '88%' }]}>
-              <View style={styles.rowBetween}>
-                <Text style={styles.modalTitle}>cGPA & Modules Transcript</Text>
-                <TouchableOpacity onPress={() => setCgpaModalVisible(false)}>
-                  <Ionicons name="close" size={24} color={THEME.primary} />
-                </TouchableOpacity>
-              </View>
+  // --- GLOBAL CGPA TRANSCRIPT TABLE MODAL (MODULE | ACADEMIC UNIT | GRADE) ---
+  const CgpaModal = () => {
+    const [newModCode, setNewModCode] = useState('');
+    const [newModName, setNewModName] = useState('');
+    const [newModAU, setNewModAU] = useState('4');
+    const [newModGrade, setNewModGrade] = useState('Auto');
 
-              {/* Summary Strip */}
-              <View style={styles.transcriptSummary}>
-                <View>
-                  <Text style={styles.summaryLabel}>Cumulative GPA</Text>
-                  <Text style={styles.summaryValue}>{cumulativeGPA} / 5.00</Text>
-                </View>
-                <View style={{ alignItems: 'flex-end' }}>
-                  <Text style={styles.summaryLabel}>Total Academic Units</Text>
-                  <Text style={styles.summaryValue}>{totalAUs} AU</Text>
-                </View>
-              </View>
+    const addNewModule = () => {
+      if (!newModCode.trim()) return;
+      const created: Module = {
+        id: `m-${Date.now()}`,
+        code: newModCode.trim().toUpperCase(),
+        name: newModName.trim() || 'University Module',
+        credits: parseInt(newModAU, 10) || 4,
+        manualGrade: newModGrade,
+        totalChapters: 8,
+        completedChapters: [],
+        gradedItems: [],
+        resources: [],
+      };
+      setModules((prev) => [...prev, created]);
+      setNewModCode('');
+      setNewModName('');
+      setNewModAU('4');
+      setNewModGrade('Auto');
+    };
 
-              {/* Table Header */}
-              <View style={styles.tableHeader}>
-                <Text style={[styles.tableHeaderCell, { flex: 2.2 }]}>Module</Text>
-                <Text style={[styles.tableHeaderCell, { flex: 0.8, textAlign: 'center' }]}>AU</Text>
-                <Text style={[styles.tableHeaderCell, { flex: 1.2, textAlign: 'center' }]}>Grade</Text>
-                <Text style={[styles.tableHeaderCell, { flex: 0.8, textAlign: 'right' }]}>Pt</Text>
-              </View>
+    const cycleModuleGrade = (modId: string) => {
+      setModules((prev) =>
+        prev.map((m) => {
+          if (m.id !== modId) return m;
+          const current = m.manualGrade || 'Auto';
+          const next = GRADE_OPTIONS[(GRADE_OPTIONS.indexOf(current) + 1) % GRADE_OPTIONS.length];
+          return { ...m, manualGrade: next };
+        })
+      );
+    };
 
-              {/* Table Rows */}
-              <ScrollView style={{ maxHeight: 240 }}>
-                {modules.map((m) => {
-                  const mStats = calculateStats(m);
-                  return (
-                    <View key={m.id} style={styles.tableRow}>
-                      <View style={{ flex: 2.2, paddingRight: 4 }}>
-                        <Text style={styles.tableCode}>{m.code}</Text>
-                        <Text style={styles.tableSubName} numberOfLines={1}>
-                          {m.name}
-                        </Text>
-                      </View>
-                      <Text style={[styles.tableCell, { flex: 0.8, textAlign: 'center' }]}>
-                        {m.credits}
-                      </Text>
-                      <View style={{ flex: 1.2, alignItems: 'center' }}>
-                        <TouchableOpacity
-                          style={styles.gradeTapPill}
-                          onPress={() => cycleModuleGrade(m.id)}
-                        >
-                          <Text style={styles.gradeTapText}>
-                            {mStats.effectiveLetter} ↻
-                          </Text>
-                        </TouchableOpacity>
-                      </View>
-                      <View style={{ flex: 0.8, flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center', gap: 6 }}>
-                        <Text style={styles.tableCell}>{mStats.gpaPoint.toFixed(1)}</Text>
-                        <TouchableOpacity onPress={() => deleteModule(m.id)}>
-                          <Ionicons name="trash-outline" size={15} color={THEME.accentAlert} />
-                        </TouchableOpacity>
-                      </View>
-                    </View>
-                  );
-                })}
-              </ScrollView>
-              <Text style={styles.helperHint}>Tip: Tap any Grade pill (e.g. A- ↻) to manually override its grade.</Text>
+    const deleteModule = (modId: string) => {
+      if (modules.length <= 1) {
+        Alert.alert('Cannot Delete', 'Keep at least one module in your tracker.');
+        return;
+      }
+      setModules((prev) => prev.filter((m) => m.id !== modId));
+    };
 
-              {/* Add Module Form inside Transcript */}
-              <View style={styles.divider} />
-              <Text style={styles.label}>+ Add Module to Transcript</Text>
-              <View style={styles.rowBetween}>
-                <TextInput
-                  style={[styles.input, { width: '34%' }]}
-                  placeholder="Code (CS1010)"
-                  placeholderTextColor={THEME.textMuted}
-                  value={newModCode}
-                  onChangeText={setNewModCode}
-                />
-                <TextInput
-                  style={[styles.input, { width: '42%' }]}
-                  placeholder="Module Name"
-                  placeholderTextColor={THEME.textMuted}
-                  value={newModName}
-                  onChangeText={setNewModName}
-                />
-                <TextInput
-                  style={[styles.input, { width: '20%' }]}
-                  placeholder="AU (4)"
-                  placeholderTextColor={THEME.textMuted}
-                  keyboardType="numeric"
-                  value={newModAU}
-                  onChangeText={setNewModAU}
-                />
-              </View>
-
-              <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 10 }}>
-                {GRADE_OPTIONS.map((g) => (
-                  <TouchableOpacity
-                    key={g}
-                    style={[styles.chip, newModGrade === g && styles.chipActive]}
-                    onPress={() => setNewModGrade(g)}
-                  >
-                    <Text style={newModGrade === g ? styles.chipTextActive : styles.chipText}>
-                      {g === 'Auto' ? 'Auto (from CA)' : g}
-                    </Text>
-                  </TouchableOpacity>
-                ))}
-              </ScrollView>
-
-              <TouchableOpacity style={styles.primaryBtn} onPress={addNewModule}>
-                <Text style={styles.primaryBtnText}>Add Module</Text>
+    return (
+      <Modal visible={cgpaModalVisible} animationType="slide" transparent>
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalBox, { maxHeight: '90%' }]}>
+            <View style={styles.rowBetween}>
+              <Text style={styles.modalTitle}>cGPA & Modules Table</Text>
+              <TouchableOpacity onPress={() => setCgpaModalVisible(false)}>
+                <Ionicons name="close" size={24} color={THEME.primary} />
               </TouchableOpacity>
             </View>
+
+            {/* Summary Banner */}
+            <View style={styles.transcriptSummary}>
+              <View>
+                <Text style={styles.summaryLabel}>Cumulative GPA</Text>
+                <Text style={styles.summaryValue}>{cumulativeGPA} / 5.00</Text>
+              </View>
+              <View style={{ alignItems: 'flex-end' }}>
+                <Text style={styles.summaryLabel}>Total Academic Units</Text>
+                <Text style={styles.summaryValue}>{totalAUs} AU</Text>
+              </View>
+            </View>
+
+            {/* Explicit 3-Column Table Header: Module | Academic Unit | Grade */}
+            <View style={styles.tableHeader}>
+              <Text style={[styles.tableHeaderCell, { flex: 2.2 }]}>Module</Text>
+              <Text style={[styles.tableHeaderCell, { flex: 1.2, textAlign: 'center' }]}>Academic Unit</Text>
+              <Text style={[styles.tableHeaderCell, { flex: 1.2, textAlign: 'center' }]}>Grade</Text>
+              <View style={{ width: 24 }} />
+            </View>
+
+            <ScrollView style={{ maxHeight: 240 }}>
+              {modules.map((m) => {
+                const mStats = calculateStats(m);
+                return (
+                  <View key={m.id} style={styles.tableRow}>
+                    <View style={{ flex: 2.2, paddingRight: 4 }}>
+                      <Text style={styles.tableCode}>{m.code}</Text>
+                      <Text style={styles.tableSubName} numberOfLines={1}>
+                        {m.name}
+                      </Text>
+                    </View>
+                    <Text style={[styles.tableCell, { flex: 1.2, textAlign: 'center' }]}>
+                      {m.credits} AU
+                    </Text>
+                    <View style={{ flex: 1.2, alignItems: 'center' }}>
+                      <TouchableOpacity
+                        style={styles.gradeTapPill}
+                        onPress={() => cycleModuleGrade(m.id)}
+                      >
+                        <Text style={styles.gradeTapText}>
+                          {mStats.effectiveLetter} ({mStats.gpaPoint.toFixed(1)})
+                        </Text>
+                      </TouchableOpacity>
+                    </View>
+                    <TouchableOpacity
+                      style={{ width: 24, alignItems: 'flex-end' }}
+                      onPress={() => deleteModule(m.id)}
+                    >
+                      <Ionicons name="trash-outline" size={16} color={THEME.accentAlert} />
+                    </TouchableOpacity>
+                  </View>
+                );
+              })}
+            </ScrollView>
+            <Text style={styles.helperHint}>Tap any Grade pill to change its letter grade (A+ to F or Auto).</Text>
+
+            <View style={styles.divider} />
+            <Text style={styles.label}>+ Add Module to Table</Text>
+            <View style={styles.rowBetween}>
+              <TextInput
+                style={[styles.input, { width: '33%' }]}
+                placeholder="Code (CS1010)"
+                placeholderTextColor={THEME.textMuted}
+                value={newModCode}
+                onChangeText={setNewModCode}
+              />
+              <TextInput
+                style={[styles.input, { width: '43%' }]}
+                placeholder="Module Name"
+                placeholderTextColor={THEME.textMuted}
+                value={newModName}
+                onChangeText={setNewModName}
+              />
+              <TextInput
+                style={[styles.input, { width: '20%' }]}
+                placeholder="AU (4)"
+                placeholderTextColor={THEME.textMuted}
+                keyboardType="numeric"
+                value={newModAU}
+                onChangeText={setNewModAU}
+              />
+            </View>
+
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 10 }}>
+              {GRADE_OPTIONS.map((g) => (
+                <TouchableOpacity
+                  key={g}
+                  style={[styles.chip, newModGrade === g && styles.chipActive]}
+                  onPress={() => setNewModGrade(g)}
+                >
+                  <Text style={newModGrade === g ? styles.chipTextActive : styles.chipText}>
+                    {g === 'Auto' ? 'Auto (from CA)' : g}
+                  </Text>
+                </TouchableOpacity>
+              ))}
+            </ScrollView>
+
+            <TouchableOpacity style={styles.primaryBtn} onPress={addNewModule}>
+              <Text style={styles.primaryBtnText}>Add Module</Text>
+            </TouchableOpacity>
           </View>
-        </Modal>
-      </SafeAreaView>
+        </View>
+      </Modal>
     );
   };
 
@@ -1361,6 +1612,7 @@ export default function App() {
         <Tab.Screen name="Calendar" component={CalendarScreen} />
         <Tab.Screen name="Modules" component={ModulesScreen} />
       </Tab.Navigator>
+      <CgpaModal />
     </NavigationContainer>
   );
 }
@@ -1380,8 +1632,19 @@ const styles = StyleSheet.create({
   dueText: { fontSize: 13, color: THEME.textMuted },
   linkText: { fontSize: 12, color: THEME.primary, fontWeight: '700', textDecorationLine: 'underline' },
   badge: { backgroundColor: THEME.secondary, color: THEME.primary, fontSize: 11, fontWeight: '700', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6, alignSelf: 'flex-start' },
-  gpaBadge: { backgroundColor: THEME.primary, paddingHorizontal: 12, paddingVertical: 6, borderRadius: 8 },
+  gpaBadge: { backgroundColor: THEME.primary, paddingHorizontal: 12, paddingVertical: 7, borderRadius: 8 },
   gpaBadgeText: { color: THEME.secondary, fontWeight: '800', fontSize: 13 },
+
+  // Chapter Revision Progress Bar
+  progressTrack: { height: 10, backgroundColor: '#E4E6E1', borderRadius: 6, overflow: 'hidden', marginVertical: 8, borderWidth: 1, borderColor: THEME.secondary },
+  progressFill: { height: '100%', backgroundColor: THEME.primary, borderRadius: 6 },
+  stepperBtn: { width: 26, height: 26, borderRadius: 6, backgroundColor: THEME.secondary, alignItems: 'center', justifyContent: 'center' },
+  stepperBtnText: { fontSize: 16, fontWeight: '800', color: THEME.primary },
+  chapterGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 4 },
+  chapterPill: { paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8, backgroundColor: '#ECEEE9', borderWidth: 1, borderColor: THEME.secondary },
+  chapterPillDone: { backgroundColor: THEME.primary, borderColor: THEME.primary },
+  chapterPillText: { fontSize: 12, fontWeight: '700', color: THEME.primary },
+  revisedMiniBtn: { paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6, backgroundColor: '#ECEEE9', borderWidth: 1, borderColor: THEME.secondary },
 
   // Status selector buttons
   statusSelectorRow: { flexDirection: 'row', gap: 6, marginTop: 8 },
@@ -1401,18 +1664,18 @@ const styles = StyleSheet.create({
   transcriptSummary: { flexDirection: 'row', justifyContent: 'space-between', backgroundColor: THEME.primary, padding: 12, borderRadius: 10, marginBottom: 12 },
   summaryLabel: { fontSize: 11, color: THEME.secondary, fontWeight: '600' },
   summaryValue: { fontSize: 18, color: '#FFFFFF', fontWeight: '800', marginTop: 2 },
-  tableHeader: { flexDirection: 'row', backgroundColor: THEME.secondary, paddingVertical: 8, paddingHorizontal: 10, borderTopLeftRadius: 8, borderTopRightRadius: 8 },
-  tableHeaderCell: { fontSize: 12, fontWeight: '800', color: THEME.primary },
+  tableHeader: { flexDirection: 'row', alignItems: 'center', backgroundColor: THEME.secondary, paddingVertical: 8, paddingHorizontal: 10, borderTopLeftRadius: 8, borderTopRightRadius: 8 },
+  tableHeaderCell: { fontSize: 11, fontWeight: '800', color: THEME.primary },
   tableRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 10, paddingHorizontal: 10, borderBottomWidth: 1, borderBottomColor: '#E5E7E3', backgroundColor: '#FAFAF9' },
   tableCode: { fontSize: 13, fontWeight: '800', color: THEME.primary },
   tableSubName: { fontSize: 11, color: THEME.textMuted },
   tableCell: { fontSize: 13, fontWeight: '700', color: THEME.primary },
   gradeTapPill: { backgroundColor: THEME.primary, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6 },
-  gradeTapText: { color: '#FFFFFF', fontSize: 12, fontWeight: '700' },
+  gradeTapText: { color: '#FFFFFF', fontSize: 11, fontWeight: '700' },
   divider: { height: 1, backgroundColor: THEME.secondary, marginVertical: 12 },
 
   // Hourly Calendar Grid
-  helperHint: { fontSize: 11, color: THEME.textMuted, marginTop: 6, marginBottom: 8 },
+  helperHint: { fontSize: 11, color: THEME.textMuted, marginTop: 4, marginBottom: 8 },
   hourRow: { flexDirection: 'row', alignItems: 'flex-start', marginBottom: 8 },
   hourLabel: { width: 52, fontSize: 12, fontWeight: '700', color: THEME.textMuted, paddingTop: 10 },
   emptySlotBtn: { borderWidth: 1, borderStyle: 'dashed', borderColor: THEME.secondary, borderRadius: 8, paddingVertical: 10, paddingHorizontal: 12, backgroundColor: '#FAFAF9' },
