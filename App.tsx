@@ -17,7 +17,8 @@ import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { Ionicons } from '@expo/vector-icons';
 import * as Notifications from 'expo-notifications';
 import * as DocumentPicker from 'expo-document-picker';
-import * as FileSystem from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy';
+import * as Sharing from 'expo-sharing';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 // --- THEME PALETTE (#23324A & #C7C9C2) ---
@@ -31,6 +32,23 @@ const THEME = {
   accentAlert: '#B91C1C', // Crimson for baited deadlines
 };
 
+// --- GRADE POINT SCALE (5.0 SYSTEM) ---
+const GRADE_POINTS: Record<string, number> = {
+  'A+': 5.0,
+  'A': 5.0,
+  'A-': 4.5,
+  'B+': 4.0,
+  'B': 3.5,
+  'B-': 3.0,
+  'C+': 2.5,
+  'C': 2.0,
+  'D+': 1.5,
+  'D': 1.0,
+  'F': 0.0,
+};
+
+const GRADE_OPTIONS = ['Auto', 'A+', 'A', 'A-', 'B+', 'B', 'B-', 'C+', 'C', 'D+', 'D', 'F'];
+
 // --- NOTIFICATION CONFIGURATION ---
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
@@ -43,13 +61,14 @@ Notifications.setNotificationHandler({
 
 // --- TYPES ---
 type TaskStatus = 'Todo' | 'In Progress' | 'Done';
+type RevisionStatus = 'Unattempted' | 'Needs Review' | 'Mastered';
 
 interface Task {
   id: string;
   moduleId: string;
   title: string;
   status: TaskStatus;
-  actualDueDate: string; // YYYY-MM-DD
+  actualDueDate: string;
   baitEnabled: boolean;
 }
 
@@ -66,13 +85,16 @@ interface ResourceItem {
   type: 'Note' | 'Tutorial' | 'PYP';
   title: string;
   contentOrStatus: string;
+  pdfUri?: string;
+  pdfName?: string;
 }
 
 interface Module {
   id: string;
   code: string;
   name: string;
-  credits: number;
+  credits: number; // Academic Units (AU)
+  manualGrade?: string; // Optional override e.g. 'A-' or 'Auto'
   gradedItems: GradedItem[];
   resources: ResourceItem[];
 }
@@ -93,6 +115,7 @@ const INITIAL_MODULES: Module[] = [
     code: 'CS2040S',
     name: 'Data Structures & Algorithms',
     credits: 4,
+    manualGrade: 'Auto',
     gradedItems: [
       { id: 'g1', name: 'Problem Set 1', weight: 15, score: 14, maxScore: 15 },
       { id: 'g2', name: 'Midterm Exam', weight: 35, score: 78, maxScore: 100 },
@@ -108,6 +131,7 @@ const INITIAL_MODULES: Module[] = [
     code: 'MA1521',
     name: 'Calculus for Computing',
     credits: 4,
+    manualGrade: 'Auto',
     gradedItems: [
       { id: 'g3', name: 'Quiz 1', weight: 20, score: 18, maxScore: 20 },
     ],
@@ -143,6 +167,11 @@ const INITIAL_BLOCKS: CalendarBlock[] = [
   { id: 'b3', title: 'MA1521 Tutorial', day: 'Wed', startTime: '13:00', endTime: '14:00', type: 'Class' },
 ];
 
+const HOURS = [
+  '08:00', '09:00', '10:00', '11:00', '12:00', '13:00',
+  '14:00', '15:00', '16:00', '17:00', '18:00', '19:00', '20:00', '21:00',
+];
+
 const Tab = createBottomTabNavigator();
 
 export default function App() {
@@ -158,7 +187,7 @@ export default function App() {
       if (status !== 'granted') {
         Alert.alert('Permission needed', 'Enable notifications to get status check-ins and deadline alerts.');
       }
-      const saved = await AsyncStorage.getItem('@study_tracker_v1');
+      const saved = await AsyncStorage.getItem('@study_tracker_v3');
       if (saved) {
         const parsed = JSON.parse(saved);
         setModules(parsed.modules || INITIAL_MODULES);
@@ -171,7 +200,7 @@ export default function App() {
 
   useEffect(() => {
     AsyncStorage.setItem(
-      '@study_tracker_v1',
+      '@study_tracker_v3',
       JSON.stringify({ modules, tasks, calendarBlocks, globalBaitMode })
     );
   }, [modules, tasks, calendarBlocks, globalBaitMode]);
@@ -197,9 +226,9 @@ export default function App() {
         sound: true,
       },
       trigger: {
-  type: Notifications.SchedulableTriggerInputTypes.TIME_INTERVAL,
-  seconds: 2, // (or 5 for scheduleTaskNotification)
-},
+        type: Notifications.SchedulableTriggerInputTypes.TIME_INTERVAL,
+        seconds: 2,
+      },
     });
     Alert.alert('Notification Scheduled', 'Lock your phone or wait 2 seconds to see the pop-up reminder.');
   };
@@ -212,9 +241,9 @@ export default function App() {
         body: `"${task.title}" is due on ${effectiveDate}. Update your progress!`,
       },
       trigger: {
-  type: Notifications.SchedulableTriggerInputTypes.TIME_INTERVAL,
-  seconds: 5, // (or 5 for scheduleTaskNotification)
-},
+        type: Notifications.SchedulableTriggerInputTypes.TIME_INTERVAL,
+        seconds: 5,
+      },
     });
   };
 
@@ -226,15 +255,8 @@ export default function App() {
     const [dueDateInput, setDueDateInput] = useState('2026-11-28');
     const [baitToggle, setBaitToggle] = useState(true);
 
-    const cycleStatus = (id: string) => {
-      const order: TaskStatus[] = ['Todo', 'In Progress', 'Done'];
-      setTasks((prev) =>
-        prev.map((t) => {
-          if (t.id !== id) return t;
-          const next = order[(order.indexOf(t.status) + 1) % order.length];
-          return { ...t, status: next };
-        })
-      );
+    const setTaskStatus = (id: string, status: TaskStatus) => {
+      setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, status } : t)));
     };
 
     const addTask = async () => {
@@ -295,46 +317,56 @@ export default function App() {
               <View key={task.id} style={styles.card}>
                 <View style={styles.rowBetween}>
                   <Text style={styles.badge}>{mod?.code || 'GEN'}</Text>
-                  <TouchableOpacity
-                    style={[
-                      styles.statusPill,
-                      task.status === 'Done'
-                        ? styles.statusDone
-                        : task.status === 'In Progress'
-                        ? styles.statusProgress
-                        : styles.statusTodo,
-                    ]}
-                    onPress={() => cycleStatus(task.id)}
-                  >
-                    <Text style={styles.statusText}>{task.status} ↻</Text>
-                  </TouchableOpacity>
+                  <Text style={styles.dueText}>
+                    Due:{' '}
+                    <Text style={{ fontWeight: '700', color: isBaited ? THEME.accentAlert : THEME.primary }}>
+                      {effectiveDate}
+                    </Text>
+                    {isBaited && !isRevealed ? ' (-7d)' : ''}
+                  </Text>
                 </View>
 
                 <Text style={[styles.taskTitle, task.status === 'Done' && styles.strike]}>
                   {task.title}
                 </Text>
 
-                <View style={styles.rowBetween}>
-                  <Text style={styles.dueText}>
-                    Due:{' '}
-                    <Text style={{ fontWeight: '700', color: isBaited ? THEME.accentAlert : THEME.primary }}>
-                      {effectiveDate}
-                    </Text>
-                    {isBaited && !isRevealed ? ' (Baited -7d)' : ''}
-                  </Text>
-
-                  {isBaited && (
-                    <TouchableOpacity
-                      onPress={() =>
-                        setRevealedTaskIds((p) => ({ ...p, [task.id]: !p[task.id] }))
-                      }
-                    >
-                      <Text style={styles.linkText}>
-                        {isRevealed ? `Real: ${task.actualDueDate}` : 'Peek Real Date'}
-                      </Text>
-                    </TouchableOpacity>
-                  )}
+                <View style={styles.statusSelectorRow}>
+                  {(['Todo', 'In Progress', 'Done'] as TaskStatus[]).map((st) => {
+                    const active = task.status === st;
+                    return (
+                      <TouchableOpacity
+                        key={st}
+                        style={[
+                          styles.statusOptionBtn,
+                          active &&
+                            (st === 'Done'
+                              ? styles.statusDoneActive
+                              : st === 'In Progress'
+                              ? styles.statusProgressActive
+                              : styles.statusTodoActive),
+                        ]}
+                        onPress={() => setTaskStatus(task.id, st)}
+                      >
+                        <Text style={[styles.statusOptionText, active && { color: '#FFFFFF' }]}>
+                          {st}
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  })}
                 </View>
+
+                {isBaited && (
+                  <TouchableOpacity
+                    style={{ marginTop: 8, alignSelf: 'flex-end' }}
+                    onPress={() =>
+                      setRevealedTaskIds((p) => ({ ...p, [task.id]: !p[task.id] }))
+                    }
+                  >
+                    <Text style={styles.linkText}>
+                      {isRevealed ? `Real Deadline: ${task.actualDueDate}` : 'Peek Real Date'}
+                    </Text>
+                  </TouchableOpacity>
+                )}
               </View>
             );
           })}
@@ -396,16 +428,31 @@ export default function App() {
     );
   };
 
-  // --- SCREEN 2: CALENDAR & TIMETABLE IMPORT ---
+  // --- SCREEN 2: INTERACTIVE TIME-BLOCKING CALENDAR & TIMETABLE IMPORT ---
   const CalendarScreen = () => {
     const [selectedDay, setSelectedDay] = useState('Mon');
     const [blockModal, setBlockModal] = useState(false);
     const [title, setTitle] = useState('');
-    const [start, setStart] = useState('16:00');
-    const [end, setEnd] = useState('18:00');
+    const [start, setStart] = useState('14:00');
+    const [durationHours, setDurationHours] = useState<number>(1);
     const [type, setType] = useState<'Study' | 'Personal' | 'Class'>('Study');
 
     const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+    const computeEndTime = (startStr: string, hrs: number) => {
+      const [hStr, mStr] = startStr.split(':');
+      const startH = parseInt(hStr || '9', 10);
+      const endH = Math.min(23, startH + hrs);
+      return `${endH.toString().padStart(2, '0')}:${mStr || '00'}`;
+    };
+
+    const openSlotPicker = (hourStr: string) => {
+      setStart(hourStr);
+      setDurationHours(1);
+      setTitle('');
+      setType('Study');
+      setBlockModal(true);
+    };
 
     const handleImportICS = async () => {
       try {
@@ -461,12 +508,13 @@ export default function App() {
     };
 
     const addTimeBlock = () => {
-      if (!title.trim()) return;
+      const finalTitle = title.trim() || `${type} Session`;
+      const end = computeEndTime(start, durationHours);
       setCalendarBlocks((prev) => [
         ...prev,
         {
           id: Date.now().toString(),
-          title: title.trim(),
+          title: finalTitle,
           day: selectedDay,
           startTime: start,
           endTime: end,
@@ -475,6 +523,17 @@ export default function App() {
       ]);
       setTitle('');
       setBlockModal(false);
+    };
+
+    const deleteBlock = (id: string) => {
+      Alert.alert('Remove Time Block', 'Delete this scheduled block?', [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: () => setCalendarBlocks((prev) => prev.filter((b) => b.id !== id)),
+        },
+      ]);
     };
 
     const dayBlocks = calendarBlocks
@@ -489,7 +548,7 @@ export default function App() {
             <TouchableOpacity style={[styles.secondaryBtn, { marginTop: 0 }]} onPress={handleImportICS}>
               <Text style={styles.secondaryBtnText}>Import .ics</Text>
             </TouchableOpacity>
-            <TouchableOpacity style={styles.primaryBtn} onPress={() => setBlockModal(true)}>
+            <TouchableOpacity style={styles.primaryBtn} onPress={() => openSlotPicker('14:00')}>
               <Text style={styles.primaryBtnText}>+ Block Time</Text>
             </TouchableOpacity>
           </View>
@@ -507,67 +566,106 @@ export default function App() {
           ))}
         </View>
 
-        <ScrollView contentContainerStyle={{ paddingBottom: 30 }}>
-          {dayBlocks.length === 0 ? (
-            <Text style={styles.emptyText}>
-              No blocks scheduled for {selectedDay}. Tap "+ Block Time" to plan a study session.
-            </Text>
-          ) : (
-            dayBlocks.map((b) => (
-              <View
-                key={b.id}
-                style={[
-                  styles.card,
-                  {
-                    borderLeftWidth: 5,
-                    borderLeftColor:
-                      b.type === 'Class'
-                        ? THEME.primary
-                        : b.type === 'Study'
-                        ? '#2E6F40'
-                        : THEME.secondary,
-                  },
-                ]}
-              >
-                <View style={styles.rowBetween}>
-                  <Text style={styles.timeText}>
-                    {b.startTime} - {b.endTime}
-                  </Text>
-                  <Text style={styles.badge}>{b.type}</Text>
+        <Text style={styles.helperHint}>Tap any empty hour slot below to block out study or personal time:</Text>
+
+        <ScrollView contentContainerStyle={{ paddingBottom: 40 }}>
+          {HOURS.map((hour) => {
+            const hourInt = parseInt(hour.split(':')[0], 10);
+            const matchingBlocks = dayBlocks.filter((b) => {
+              const bStart = parseInt(b.startTime.split(':')[0], 10);
+              const bEnd = parseInt(b.endTime.split(':')[0], 10);
+              return hourInt >= bStart && hourInt < Math.max(bStart + 1, bEnd);
+            });
+
+            return (
+              <View key={hour} style={styles.hourRow}>
+                <Text style={styles.hourLabel}>{hour}</Text>
+                <View style={{ flex: 1 }}>
+                  {matchingBlocks.length > 0 ? (
+                    matchingBlocks.map((b) => (
+                      <TouchableOpacity
+                        key={`${b.id}-${hour}`}
+                        onLongPress={() => deleteBlock(b.id)}
+                        style={[
+                          styles.timelineBlock,
+                          {
+                            backgroundColor:
+                              b.type === 'Class'
+                                ? THEME.primary
+                                : b.type === 'Study'
+                                ? '#2E6F40'
+                                : '#6B7280',
+                          },
+                        ]}
+                      >
+                        <View style={styles.rowBetween}>
+                          <Text style={styles.timelineBlockTitle}>{b.title}</Text>
+                          <TouchableOpacity onPress={() => deleteBlock(b.id)}>
+                            <Ionicons name="close-circle" size={18} color="#FFFFFF" />
+                          </TouchableOpacity>
+                        </View>
+                        <Text style={styles.timelineBlockSub}>
+                          {b.startTime} - {b.endTime} • {b.type}
+                        </Text>
+                      </TouchableOpacity>
+                    ))
+                  ) : (
+                    <TouchableOpacity
+                      style={styles.emptySlotBtn}
+                      onPress={() => openSlotPicker(hour)}
+                    >
+                      <Text style={styles.emptySlotText}>+ Tap to block {hour}</Text>
+                    </TouchableOpacity>
+                  )}
                 </View>
-                <Text style={styles.taskTitle}>{b.title}</Text>
               </View>
-            ))
-          )}
+            );
+          })}
         </ScrollView>
 
         <Modal visible={blockModal} animationType="slide" transparent>
           <View style={styles.modalOverlay}>
             <View style={styles.modalBox}>
               <Text style={styles.modalTitle}>Block Out Time ({selectedDay})</Text>
+
+              <Text style={styles.label}>Activity / Study Focus:</Text>
               <TextInput
                 style={styles.input}
-                placeholder="Activity (e.g., Revise Lecture 5 / Gym)"
+                placeholder="e.g., CS2040S Revision / Gym / Break"
                 placeholderTextColor={THEME.textMuted}
                 value={title}
                 onChangeText={setTitle}
               />
-              <View style={styles.rowBetween}>
-                <TextInput
-                  style={[styles.input, { width: '48%' }]}
-                  value={start}
-                  onChangeText={setStart}
-                  placeholder="Start (14:00)"
-                  placeholderTextColor={THEME.textMuted}
-                />
-                <TextInput
-                  style={[styles.input, { width: '48%' }]}
-                  value={end}
-                  onChangeText={setEnd}
-                  placeholder="End (16:00)"
-                  placeholderTextColor={THEME.textMuted}
-                />
+
+              <Text style={styles.label}>Start Time:</Text>
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 10 }}>
+                {HOURS.map((h) => (
+                  <TouchableOpacity
+                    key={h}
+                    style={[styles.chip, start === h && styles.chipActive]}
+                    onPress={() => setStart(h)}
+                  >
+                    <Text style={start === h ? styles.chipTextActive : styles.chipText}>{h}</Text>
+                  </TouchableOpacity>
+                ))}
+              </ScrollView>
+
+              <Text style={styles.label}>Duration:</Text>
+              <View style={styles.chipRow}>
+                {[1, 2, 3, 4].map((hrs) => (
+                  <TouchableOpacity
+                    key={hrs}
+                    style={[styles.chip, durationHours === hrs && styles.chipActive]}
+                    onPress={() => setDurationHours(hrs)}
+                  >
+                    <Text style={durationHours === hrs ? styles.chipTextActive : styles.chipText}>
+                      {hrs} {hrs === 1 ? 'hr' : 'hrs'} ({start} - {computeEndTime(start, hrs)})
+                    </Text>
+                  </TouchableOpacity>
+                ))}
               </View>
+
+              <Text style={[styles.label, { marginTop: 8 }]}>Block Type:</Text>
               <View style={styles.chipRow}>
                 {(['Study', 'Personal', 'Class'] as const).map((t) => (
                   <TouchableOpacity
@@ -579,12 +677,13 @@ export default function App() {
                   </TouchableOpacity>
                 ))}
               </View>
-              <View style={[styles.rowBetween, { marginTop: 14 }]}>
+
+              <View style={[styles.rowBetween, { marginTop: 16 }]}>
                 <TouchableOpacity onPress={() => setBlockModal(false)}>
-                  <Text style={{ color: THEME.textMuted }}>Cancel</Text>
+                  <Text style={{ color: THEME.textMuted, fontWeight: '600' }}>Cancel</Text>
                 </TouchableOpacity>
                 <TouchableOpacity style={styles.primaryBtn} onPress={addTimeBlock}>
-                  <Text style={styles.primaryBtnText}>Save Block</Text>
+                  <Text style={styles.primaryBtnText}>Save Time Block</Text>
                 </TouchableOpacity>
               </View>
             </View>
@@ -594,22 +693,33 @@ export default function App() {
     );
   };
 
-  // --- SCREEN 3: MODULES HUB (GRADED ITEMS, GPA, NOTES, TUTORIALS/PYPs) ---
+  // --- SCREEN 3: MODULES HUB (CGPA TRANSCRIPT TABLE, PDF UPLOADS, GRADES, NOTES, TUTORIALS/PYPs) ---
   const ModulesScreen = () => {
     const [activeModId, setActiveModId] = useState<string>(modules[0]?.id || 'm1');
-    const [subTab, setSubTab] = useState<'Grades' | 'Notes' | 'Tutorials/PYP'>('Grades');
+    const [subTab, setSubTab] = useState<'Grades' | 'Notes' | 'Tutorials/PYP'>('Notes');
 
+    // cGPA Transcript Modal & Add Module inputs
+    const [cgpaModalVisible, setCgpaModalVisible] = useState(false);
+    const [newModCode, setNewModCode] = useState('');
+    const [newModName, setNewModName] = useState('');
+    const [newModAU, setNewModAU] = useState('4');
+    const [newModGrade, setNewModGrade] = useState('Auto');
+
+    // Add Graded Item inputs
     const [gName, setGName] = useState('');
     const [gWeight, setGWeight] = useState('');
     const [gScore, setGScore] = useState('');
     const [gMax, setGMax] = useState('100');
 
+    // Add Resource + PDF Attachment inputs
     const [resTitle, setResTitle] = useState('');
     const [resBody, setResBody] = useState('');
     const [resType, setResType] = useState<'Note' | 'Tutorial' | 'PYP'>('Note');
+    const [attachedPdf, setAttachedPdf] = useState<{ uri: string; name: string } | null>(null);
 
     const activeMod = modules.find((m) => m.id === activeModId) || modules[0];
 
+    // Calculate Module Percentage, Letter Grade, and 5.0 Grade Point
     const calculateStats = (mod: Module) => {
       let earnedWeight = 0;
       let totalWeight = 0;
@@ -618,27 +728,42 @@ export default function App() {
         earnedWeight += (item.score / item.maxScore) * item.weight;
       });
       const currentPct = totalWeight > 0 ? (earnedWeight / totalWeight) * 100 : 0;
-      const gpaPoint =
+
+      // Auto-derived letter grade from percentage
+      const autoLetter =
         currentPct >= 85
-          ? 5.0
+          ? 'A+'
           : currentPct >= 80
-          ? 4.5
+          ? 'A'
           : currentPct >= 75
-          ? 4.0
+          ? 'A-'
           : currentPct >= 70
-          ? 3.5
+          ? 'B+'
           : currentPct >= 65
-          ? 3.0
-          : 2.5;
+          ? 'B'
+          : currentPct >= 60
+          ? 'B-'
+          : currentPct >= 55
+          ? 'C+'
+          : currentPct >= 50
+          ? 'C'
+          : 'D';
+
+      const effectiveLetter =
+        mod.manualGrade && mod.manualGrade !== 'Auto' ? mod.manualGrade : autoLetter;
+      const gpaPoint = GRADE_POINTS[effectiveLetter] ?? 4.0;
+
       return {
         earnedWeight: earnedWeight.toFixed(1),
         totalWeight,
         currentPct: currentPct.toFixed(1),
+        effectiveLetter,
         gpaPoint,
       };
     };
 
-    const cumulativeGPA = useMemo(() => {
+    // Cumulative GPA & Total AUs across all modules
+    const { cumulativeGPA, totalAUs } = useMemo(() => {
       let totalPoints = 0;
       let totalCredits = 0;
       modules.forEach((m) => {
@@ -646,8 +771,93 @@ export default function App() {
         totalPoints += gpaPoint * m.credits;
         totalCredits += m.credits;
       });
-      return totalCredits > 0 ? (totalPoints / totalCredits).toFixed(2) : '0.00';
+      return {
+        cumulativeGPA: totalCredits > 0 ? (totalPoints / totalCredits).toFixed(2) : '0.00',
+        totalAUs: totalCredits,
+      };
     }, [modules]);
+
+    // Add new module to cGPA table
+    const addNewModule = () => {
+      if (!newModCode.trim()) return;
+      const created: Module = {
+        id: `m-${Date.now()}`,
+        code: newModCode.trim().toUpperCase(),
+        name: newModName.trim() || 'University Module',
+        credits: parseInt(newModAU, 10) || 4,
+        manualGrade: newModGrade,
+        gradedItems: [],
+        resources: [],
+      };
+      setModules((prev) => [...prev, created]);
+      setActiveModId(created.id);
+      setNewModCode('');
+      setNewModName('');
+      setNewModAU('4');
+      setNewModGrade('Auto');
+    };
+
+    const cycleModuleGrade = (modId: string) => {
+      setModules((prev) =>
+        prev.map((m) => {
+          if (m.id !== modId) return m;
+          const current = m.manualGrade || 'Auto';
+          const next = GRADE_OPTIONS[(GRADE_OPTIONS.indexOf(current) + 1) % GRADE_OPTIONS.length];
+          return { ...m, manualGrade: next };
+        })
+      );
+    };
+
+    const deleteModule = (modId: string) => {
+      if (modules.length <= 1) {
+        Alert.alert('Cannot Delete', 'Keep at least one module in your tracker.');
+        return;
+      }
+      setModules((prev) => {
+        const filtered = prev.filter((m) => m.id !== modId);
+        if (activeModId === modId) setActiveModId(filtered[0].id);
+        return filtered;
+      });
+    };
+
+    // Pick PDF file from phone storage/iCloud/Drive
+    const handlePickPDF = async () => {
+      try {
+        const res = await DocumentPicker.getDocumentAsync({
+          type: 'application/pdf',
+          copyToCacheDirectory: true,
+        });
+        if (res.canceled) return;
+        const asset = res.assets[0];
+
+        // Persist inside app documentDirectory so it stays available across restarts
+        const safeName = `${Date.now()}_${asset.name.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+        const destUri = `${FileSystem.documentDirectory}${safeName}`;
+        await FileSystem.copyAsync({ from: asset.uri, to: destUri });
+
+        setAttachedPdf({ uri: destUri, name: asset.name });
+        if (!resTitle.trim()) {
+          setResTitle(asset.name.replace(/\.pdf$/i, ''));
+        }
+      } catch (e) {
+        Alert.alert('PDF Upload Failed', 'Could not attach that PDF file.');
+      }
+    };
+
+    // Open uploaded PDF using native iOS/Android viewer sheet
+    const openAttachedPDF = async (uri?: string) => {
+      if (!uri) return;
+      try {
+        const canShare = await Sharing.isAvailableAsync();
+        if (canShare) {
+          await Sharing.shareAsync(uri, { mimeType: 'application/pdf' });
+        } else {
+          Alert.alert('Unavailable', 'PDF viewer is not available on this device.');
+        }
+      } catch (e) {
+        Alert.alert('Error', 'Unable to open this PDF file.');
+      }
+    };
 
     const addGradedItem = () => {
       if (!gName || !gWeight || !gScore) return;
@@ -675,8 +885,9 @@ export default function App() {
       setGScore('');
     };
 
-    const addResource = () => {
-      if (!resTitle.trim()) return;
+    const addResource = (forcedType?: 'Note' | 'Tutorial' | 'PYP') => {
+      const targetType = forcedType || resType;
+      if (!resTitle.trim() && !attachedPdf) return;
       setModules((prev) =>
         prev.map((m) =>
           m.id === activeMod.id
@@ -686,9 +897,14 @@ export default function App() {
                   ...m.resources,
                   {
                     id: Date.now().toString(),
-                    type: resType,
-                    title: resTitle.trim(),
-                    contentOrStatus: resType === 'Note' ? resBody || 'No details.' : 'Unattempted',
+                    type: targetType,
+                    title: resTitle.trim() || attachedPdf?.name || 'Untitled PDF',
+                    contentOrStatus:
+                      targetType === 'Note'
+                        ? resBody.trim() || (attachedPdf ? 'PDF Lecture Note attached.' : 'No notes added.')
+                        : 'Unattempted',
+                    pdfUri: attachedPdf?.uri,
+                    pdfName: attachedPdf?.name,
                   },
                 ],
               }
@@ -697,21 +913,29 @@ export default function App() {
       );
       setResTitle('');
       setResBody('');
+      setAttachedPdf(null);
     };
 
-    const togglePracticeStatus = (resId: string) => {
-      const states = ['Unattempted', 'Needs Review', 'Mastered'];
+    const setPracticeStatus = (resId: string, newStatus: RevisionStatus) => {
       setModules((prev) =>
         prev.map((m) =>
           m.id === activeMod.id
             ? {
                 ...m,
-                resources: m.resources.map((r) => {
-                  if (r.id !== resId) return r;
-                  const next = states[(states.indexOf(r.contentOrStatus) + 1) % states.length];
-                  return { ...r, contentOrStatus: next };
-                }),
+                resources: m.resources.map((r) =>
+                  r.id === resId ? { ...r, contentOrStatus: newStatus } : r
+                ),
               }
+            : m
+        )
+      );
+    };
+
+    const deleteResource = (resId: string) => {
+      setModules((prev) =>
+        prev.map((m) =>
+          m.id === activeMod.id
+            ? { ...m, resources: m.resources.filter((r) => r.id !== resId) }
             : m
         )
       );
@@ -723,9 +947,14 @@ export default function App() {
       <SafeAreaView style={styles.container}>
         <View style={styles.headerRow}>
           <Text style={styles.headerTitle}>Modules Hub</Text>
-          <View style={styles.gpaBadge}>
-            <Text style={styles.gpaBadgeText}>cGPA: {cumulativeGPA} / 5.0</Text>
-          </View>
+          {/* Tappable cGPA Pill */}
+          <TouchableOpacity
+            style={styles.gpaBadge}
+            onPress={() => setCgpaModalVisible(true)}
+            activeOpacity={0.8}
+          >
+            <Text style={styles.gpaBadgeText}>cGPA: {cumulativeGPA} / 5.0 ▾</Text>
+          </TouchableOpacity>
         </View>
 
         <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ maxHeight: 45, marginBottom: 10 }}>
@@ -736,18 +965,24 @@ export default function App() {
               onPress={() => setActiveModId(m.id)}
             >
               <Text style={activeMod.id === m.id ? styles.chipTextActive : styles.chipText}>
-                {m.code}
+                {m.code} ({m.credits} AU)
               </Text>
             </TouchableOpacity>
           ))}
+          <TouchableOpacity
+            style={[styles.chip, { borderWidth: 1, borderStyle: 'dashed', borderColor: THEME.primary }]}
+            onPress={() => setCgpaModalVisible(true)}
+          >
+            <Text style={styles.chipText}>+ Mod / Table</Text>
+          </TouchableOpacity>
         </ScrollView>
 
         <View style={styles.bannerCard}>
           <Text style={styles.bannerTitle}>
-            {activeMod.code}: {activeMod.name}
+            {activeMod.code}: {activeMod.name} ({activeMod.credits} AU)
           </Text>
           <Text style={styles.bannerSub}>
-            Current Standing: {stats.currentPct}% ({stats.earnedWeight}% / {stats.totalWeight}% graded) • Est. Grade Point: {stats.gpaPoint.toFixed(1)}
+            Standing: {stats.currentPct}% ({stats.earnedWeight}% / {stats.totalWeight}% graded) • Grade: {stats.effectiveLetter} ({stats.gpaPoint.toFixed(1)})
           </Text>
         </View>
 
@@ -756,7 +991,12 @@ export default function App() {
             <TouchableOpacity
               key={tab}
               style={[styles.subTab, subTab === tab && styles.subTabActive]}
-              onPress={() => setSubTab(tab)}
+              onPress={() => {
+                setSubTab(tab);
+                setAttachedPdf(null);
+                if (tab === 'Notes') setResType('Note');
+                if (tab === 'Tutorials/PYP') setResType('Tutorial');
+              }}
             >
               <Text style={subTab === tab ? styles.subTabTextActive : styles.subTabText}>{tab}</Text>
             </TouchableOpacity>
@@ -826,32 +1066,55 @@ export default function App() {
                 .filter((r) => r.type === 'Note')
                 .map((note) => (
                   <View key={note.id} style={styles.card}>
-                    <Text style={styles.taskTitle}>{note.title}</Text>
+                    <View style={styles.rowBetween}>
+                      <Text style={styles.taskTitle}>{note.title}</Text>
+                      <TouchableOpacity onPress={() => deleteResource(note.id)}>
+                        <Ionicons name="trash-outline" size={18} color={THEME.textMuted} />
+                      </TouchableOpacity>
+                    </View>
                     <Text style={styles.noteBody}>{note.contentOrStatus}</Text>
+
+                    {note.pdfUri && (
+                      <TouchableOpacity
+                        style={styles.pdfChipBtn}
+                        onPress={() => openAttachedPDF(note.pdfUri)}
+                      >
+                        <Ionicons name="document-text" size={16} color={THEME.primary} />
+                        <Text style={styles.pdfChipText} numberOfLines={1}>
+                          Open PDF: {note.pdfName || 'Lecture_Notes.pdf'}
+                        </Text>
+                      </TouchableOpacity>
+                    )}
                   </View>
                 ))}
+
               <View style={styles.card}>
-                <Text style={styles.label}>+ Add Study Note</Text>
+                <Text style={styles.label}>+ Add Study Note / Upload Lecture PDF</Text>
                 <TextInput
                   style={styles.input}
-                  placeholder="Topic / Lecture Title"
+                  placeholder="Lecture / Topic Title"
                   placeholderTextColor={THEME.textMuted}
                   value={resTitle}
-                  onChangeText={(t) => {
-                    setResType('Note');
-                    setResTitle(t);
-                  }}
+                  onChangeText={setResTitle}
                 />
                 <TextInput
-                  style={[styles.input, { height: 70 }]}
+                  style={[styles.input, { height: 65 }]}
                   multiline
-                  placeholder="Key formulas, concepts, summaries..."
+                  placeholder="Summary notes (optional if uploading PDF)..."
                   placeholderTextColor={THEME.textMuted}
                   value={resBody}
                   onChangeText={setResBody}
                 />
-                <TouchableOpacity style={styles.primaryBtn} onPress={addResource}>
-                  <Text style={styles.primaryBtnText}>Save Note</Text>
+
+                <TouchableOpacity style={styles.uploadOutlineBtn} onPress={handlePickPDF}>
+                  <Ionicons name="cloud-upload-outline" size={18} color={THEME.primary} />
+                  <Text style={styles.uploadOutlineText}>
+                    {attachedPdf ? `Attached: ${attachedPdf.name}` : 'Upload Lecture Notes PDF'}
+                  </Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity style={styles.primaryBtn} onPress={() => addResource('Note')}>
+                  <Text style={styles.primaryBtnText}>Save Note & PDF</Text>
                 </TouchableOpacity>
               </View>
             </>
@@ -864,21 +1127,59 @@ export default function App() {
                 .map((item) => (
                   <View key={item.id} style={styles.card}>
                     <View style={styles.rowBetween}>
-                      <View>
-                        <Text style={styles.badge}>{item.type}</Text>
-                        <Text style={[styles.taskTitle, { marginTop: 4 }]}>{item.title}</Text>
-                      </View>
-                      <TouchableOpacity
-                        style={styles.statusPill}
-                        onPress={() => togglePracticeStatus(item.id)}
-                      >
-                        <Text style={styles.statusText}>{item.contentOrStatus} ↻</Text>
+                      <Text style={styles.badge}>{item.type}</Text>
+                      <TouchableOpacity onPress={() => deleteResource(item.id)}>
+                        <Ionicons name="trash-outline" size={18} color={THEME.textMuted} />
                       </TouchableOpacity>
+                    </View>
+                    <Text style={styles.taskTitle}>{item.title}</Text>
+
+                    {item.pdfUri && (
+                      <TouchableOpacity
+                        style={[styles.pdfChipBtn, { marginBottom: 8 }]}
+                        onPress={() => openAttachedPDF(item.pdfUri)}
+                      >
+                        <Ionicons name="document-text" size={16} color={THEME.primary} />
+                        <Text style={styles.pdfChipText} numberOfLines={1}>
+                          Open PDF: {item.pdfName || 'Worksheet.pdf'}
+                        </Text>
+                      </TouchableOpacity>
+                    )}
+
+                    <View style={styles.statusSelectorRow}>
+                      {(['Unattempted', 'Needs Review', 'Mastered'] as RevisionStatus[]).map((st) => {
+                        const isSelected = item.contentOrStatus === st;
+                        return (
+                          <TouchableOpacity
+                            key={st}
+                            style={[
+                              styles.statusOptionBtn,
+                              isSelected &&
+                                (st === 'Mastered'
+                                  ? styles.statusDoneActive
+                                  : st === 'Needs Review'
+                                  ? styles.statusProgressActive
+                                  : styles.statusTodoActive),
+                            ]}
+                            onPress={() => setPracticeStatus(item.id, st)}
+                          >
+                            <Text
+                              style={[
+                                styles.statusOptionText,
+                                isSelected && { color: '#FFFFFF' },
+                              ]}
+                            >
+                              {st}
+                            </Text>
+                          </TouchableOpacity>
+                        );
+                      })}
                     </View>
                   </View>
                 ))}
+
               <View style={styles.card}>
-                <Text style={styles.label}>+ Track Tutorial or Past Year Paper</Text>
+                <Text style={styles.label}>+ Add Tutorial / PYP & Upload PDF</Text>
                 <View style={styles.chipRow}>
                   {(['Tutorial', 'PYP'] as const).map((t) => (
                     <TouchableOpacity
@@ -897,13 +1198,138 @@ export default function App() {
                   value={resTitle}
                   onChangeText={setResTitle}
                 />
-                <TouchableOpacity style={styles.primaryBtn} onPress={addResource}>
+
+                <TouchableOpacity style={styles.uploadOutlineBtn} onPress={handlePickPDF}>
+                  <Ionicons name="cloud-upload-outline" size={18} color={THEME.primary} />
+                  <Text style={styles.uploadOutlineText}>
+                    {attachedPdf ? `Attached: ${attachedPdf.name}` : 'Upload Tutorial / PYP PDF'}
+                  </Text>
+                </TouchableOpacity>
+
+                <TouchableOpacity style={styles.primaryBtn} onPress={() => addResource()}>
                   <Text style={styles.primaryBtnText}>Add to Revision List</Text>
                 </TouchableOpacity>
               </View>
             </>
           )}
         </ScrollView>
+
+        {/* CGPA TRANSCRIPT TABLE MODAL */}
+        <Modal visible={cgpaModalVisible} animationType="slide" transparent>
+          <View style={styles.modalOverlay}>
+            <View style={[styles.modalBox, { maxHeight: '88%' }]}>
+              <View style={styles.rowBetween}>
+                <Text style={styles.modalTitle}>cGPA & Modules Transcript</Text>
+                <TouchableOpacity onPress={() => setCgpaModalVisible(false)}>
+                  <Ionicons name="close" size={24} color={THEME.primary} />
+                </TouchableOpacity>
+              </View>
+
+              {/* Summary Strip */}
+              <View style={styles.transcriptSummary}>
+                <View>
+                  <Text style={styles.summaryLabel}>Cumulative GPA</Text>
+                  <Text style={styles.summaryValue}>{cumulativeGPA} / 5.00</Text>
+                </View>
+                <View style={{ alignItems: 'flex-end' }}>
+                  <Text style={styles.summaryLabel}>Total Academic Units</Text>
+                  <Text style={styles.summaryValue}>{totalAUs} AU</Text>
+                </View>
+              </View>
+
+              {/* Table Header */}
+              <View style={styles.tableHeader}>
+                <Text style={[styles.tableHeaderCell, { flex: 2.2 }]}>Module</Text>
+                <Text style={[styles.tableHeaderCell, { flex: 0.8, textAlign: 'center' }]}>AU</Text>
+                <Text style={[styles.tableHeaderCell, { flex: 1.2, textAlign: 'center' }]}>Grade</Text>
+                <Text style={[styles.tableHeaderCell, { flex: 0.8, textAlign: 'right' }]}>Pt</Text>
+              </View>
+
+              {/* Table Rows */}
+              <ScrollView style={{ maxHeight: 240 }}>
+                {modules.map((m) => {
+                  const mStats = calculateStats(m);
+                  return (
+                    <View key={m.id} style={styles.tableRow}>
+                      <View style={{ flex: 2.2, paddingRight: 4 }}>
+                        <Text style={styles.tableCode}>{m.code}</Text>
+                        <Text style={styles.tableSubName} numberOfLines={1}>
+                          {m.name}
+                        </Text>
+                      </View>
+                      <Text style={[styles.tableCell, { flex: 0.8, textAlign: 'center' }]}>
+                        {m.credits}
+                      </Text>
+                      <View style={{ flex: 1.2, alignItems: 'center' }}>
+                        <TouchableOpacity
+                          style={styles.gradeTapPill}
+                          onPress={() => cycleModuleGrade(m.id)}
+                        >
+                          <Text style={styles.gradeTapText}>
+                            {mStats.effectiveLetter} ↻
+                          </Text>
+                        </TouchableOpacity>
+                      </View>
+                      <View style={{ flex: 0.8, flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center', gap: 6 }}>
+                        <Text style={styles.tableCell}>{mStats.gpaPoint.toFixed(1)}</Text>
+                        <TouchableOpacity onPress={() => deleteModule(m.id)}>
+                          <Ionicons name="trash-outline" size={15} color={THEME.accentAlert} />
+                        </TouchableOpacity>
+                      </View>
+                    </View>
+                  );
+                })}
+              </ScrollView>
+              <Text style={styles.helperHint}>Tip: Tap any Grade pill (e.g. A- ↻) to manually override its grade.</Text>
+
+              {/* Add Module Form inside Transcript */}
+              <View style={styles.divider} />
+              <Text style={styles.label}>+ Add Module to Transcript</Text>
+              <View style={styles.rowBetween}>
+                <TextInput
+                  style={[styles.input, { width: '34%' }]}
+                  placeholder="Code (CS1010)"
+                  placeholderTextColor={THEME.textMuted}
+                  value={newModCode}
+                  onChangeText={setNewModCode}
+                />
+                <TextInput
+                  style={[styles.input, { width: '42%' }]}
+                  placeholder="Module Name"
+                  placeholderTextColor={THEME.textMuted}
+                  value={newModName}
+                  onChangeText={setNewModName}
+                />
+                <TextInput
+                  style={[styles.input, { width: '20%' }]}
+                  placeholder="AU (4)"
+                  placeholderTextColor={THEME.textMuted}
+                  keyboardType="numeric"
+                  value={newModAU}
+                  onChangeText={setNewModAU}
+                />
+              </View>
+
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 10 }}>
+                {GRADE_OPTIONS.map((g) => (
+                  <TouchableOpacity
+                    key={g}
+                    style={[styles.chip, newModGrade === g && styles.chipActive]}
+                    onPress={() => setNewModGrade(g)}
+                  >
+                    <Text style={newModGrade === g ? styles.chipTextActive : styles.chipText}>
+                      {g === 'Auto' ? 'Auto (from CA)' : g}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </ScrollView>
+
+              <TouchableOpacity style={styles.primaryBtn} onPress={addNewModule}>
+                <Text style={styles.primaryBtnText}>Add Module</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
       </SafeAreaView>
     );
   };
@@ -952,21 +1378,54 @@ const styles = StyleSheet.create({
   taskTitle: { fontSize: 16, fontWeight: '700', color: THEME.primary, marginVertical: 6 },
   strike: { textDecorationLine: 'line-through', color: THEME.textMuted },
   dueText: { fontSize: 13, color: THEME.textMuted },
-  timeText: { fontSize: 13, fontWeight: '700', color: THEME.primary },
   linkText: { fontSize: 12, color: THEME.primary, fontWeight: '700', textDecorationLine: 'underline' },
   badge: { backgroundColor: THEME.secondary, color: THEME.primary, fontSize: 11, fontWeight: '700', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 6, alignSelf: 'flex-start' },
-  gpaBadge: { backgroundColor: THEME.primary, paddingHorizontal: 10, paddingVertical: 5, borderRadius: 8 },
+  gpaBadge: { backgroundColor: THEME.primary, paddingHorizontal: 12, paddingVertical: 6, borderRadius: 8 },
   gpaBadgeText: { color: THEME.secondary, fontWeight: '800', fontSize: 13 },
-  statusPill: { paddingHorizontal: 10, paddingVertical: 4, borderRadius: 12, backgroundColor: THEME.secondary },
-  statusTodo: { backgroundColor: '#FADBD8' },
-  statusProgress: { backgroundColor: THEME.secondary },
-  statusDone: { backgroundColor: '#D4EFDF' },
-  statusText: { fontSize: 12, fontWeight: '700', color: THEME.primary },
-  primaryBtn: { backgroundColor: THEME.primary, paddingHorizontal: 14, paddingVertical: 8, borderRadius: 8, alignItems: 'center' },
+
+  // Status selector buttons
+  statusSelectorRow: { flexDirection: 'row', gap: 6, marginTop: 8 },
+  statusOptionBtn: { flex: 1, paddingVertical: 7, borderRadius: 8, backgroundColor: '#ECEEE9', alignItems: 'center', borderWidth: 1, borderColor: THEME.secondary },
+  statusTodoActive: { backgroundColor: '#991B1B', borderColor: '#991B1B' },
+  statusProgressActive: { backgroundColor: '#B45309', borderColor: '#B45309' },
+  statusDoneActive: { backgroundColor: '#2E6F40', borderColor: '#2E6F40' },
+  statusOptionText: { fontSize: 11, fontWeight: '700', color: THEME.primary },
+
+  // PDF upload & open chips
+  uploadOutlineBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, borderWidth: 1.5, borderStyle: 'dashed', borderColor: THEME.primary, borderRadius: 8, paddingVertical: 10, marginBottom: 10, backgroundColor: '#F8F9F7' },
+  uploadOutlineText: { fontSize: 13, fontWeight: '700', color: THEME.primary },
+  pdfChipBtn: { flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: '#E4E6E1', paddingHorizontal: 10, paddingVertical: 8, borderRadius: 8, marginTop: 8, borderWidth: 1, borderColor: THEME.secondary },
+  pdfChipText: { fontSize: 12, fontWeight: '700', color: THEME.primary, flex: 1 },
+
+  // cGPA Transcript Table Styles
+  transcriptSummary: { flexDirection: 'row', justifyContent: 'space-between', backgroundColor: THEME.primary, padding: 12, borderRadius: 10, marginBottom: 12 },
+  summaryLabel: { fontSize: 11, color: THEME.secondary, fontWeight: '600' },
+  summaryValue: { fontSize: 18, color: '#FFFFFF', fontWeight: '800', marginTop: 2 },
+  tableHeader: { flexDirection: 'row', backgroundColor: THEME.secondary, paddingVertical: 8, paddingHorizontal: 10, borderTopLeftRadius: 8, borderTopRightRadius: 8 },
+  tableHeaderCell: { fontSize: 12, fontWeight: '800', color: THEME.primary },
+  tableRow: { flexDirection: 'row', alignItems: 'center', paddingVertical: 10, paddingHorizontal: 10, borderBottomWidth: 1, borderBottomColor: '#E5E7E3', backgroundColor: '#FAFAF9' },
+  tableCode: { fontSize: 13, fontWeight: '800', color: THEME.primary },
+  tableSubName: { fontSize: 11, color: THEME.textMuted },
+  tableCell: { fontSize: 13, fontWeight: '700', color: THEME.primary },
+  gradeTapPill: { backgroundColor: THEME.primary, paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6 },
+  gradeTapText: { color: '#FFFFFF', fontSize: 12, fontWeight: '700' },
+  divider: { height: 1, backgroundColor: THEME.secondary, marginVertical: 12 },
+
+  // Hourly Calendar Grid
+  helperHint: { fontSize: 11, color: THEME.textMuted, marginTop: 6, marginBottom: 8 },
+  hourRow: { flexDirection: 'row', alignItems: 'flex-start', marginBottom: 8 },
+  hourLabel: { width: 52, fontSize: 12, fontWeight: '700', color: THEME.textMuted, paddingTop: 10 },
+  emptySlotBtn: { borderWidth: 1, borderStyle: 'dashed', borderColor: THEME.secondary, borderRadius: 8, paddingVertical: 10, paddingHorizontal: 12, backgroundColor: '#FAFAF9' },
+  emptySlotText: { fontSize: 12, color: THEME.textMuted, fontWeight: '500' },
+  timelineBlock: { padding: 10, borderRadius: 8, marginBottom: 4 },
+  timelineBlockTitle: { color: '#FFFFFF', fontWeight: '700', fontSize: 14 },
+  timelineBlockSub: { color: '#E5E7EB', fontSize: 11, marginTop: 2 },
+
+  primaryBtn: { backgroundColor: THEME.primary, paddingHorizontal: 14, paddingVertical: 9, borderRadius: 8, alignItems: 'center' },
   primaryBtnText: { color: '#FFFFFF', fontWeight: '700', fontSize: 13 },
   secondaryBtn: { flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: THEME.secondary, paddingHorizontal: 12, paddingVertical: 8, borderRadius: 8, marginTop: 10, alignSelf: 'flex-start' },
   secondaryBtnText: { color: THEME.primary, fontWeight: '700', fontSize: 12 },
-  dayBar: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 12 },
+  dayBar: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 10 },
   dayPill: { paddingVertical: 8, paddingHorizontal: 10, borderRadius: 8, backgroundColor: THEME.secondary },
   dayPillActive: { backgroundColor: THEME.primary },
   dayText: { fontSize: 12, fontWeight: '600', color: THEME.primary },
@@ -976,15 +1435,14 @@ const styles = StyleSheet.create({
   subTabActive: { backgroundColor: THEME.primary },
   subTabText: { fontSize: 13, fontWeight: '600', color: THEME.primary },
   subTabTextActive: { fontSize: 13, fontWeight: '700', color: '#FFFFFF' },
-  chipRow: { flexDirection: 'row', gap: 8, marginVertical: 6 },
+  chipRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginVertical: 6 },
   chip: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 16, backgroundColor: THEME.secondary, marginRight: 6 },
   chipActive: { backgroundColor: THEME.primary },
   chipText: { fontSize: 12, fontWeight: '600', color: THEME.primary },
   chipTextActive: { fontSize: 12, fontWeight: '700', color: '#FFFFFF' },
   noteBody: { fontSize: 14, color: THEME.textMuted, lineHeight: 20 },
-  emptyText: { textAlign: 'center', color: THEME.textMuted, marginTop: 30, fontSize: 14 },
-  modalOverlay: { flex: 1, backgroundColor: 'rgba(35, 50, 74, 0.55)', justifyContent: 'center', padding: 20 },
-  modalBox: { backgroundColor: THEME.surface, borderRadius: 14, padding: 18, borderWidth: 1, borderColor: THEME.secondary },
+  modalOverlay: { flex: 1, backgroundColor: 'rgba(35, 50, 74, 0.55)', justifyContent: 'center', padding: 16 },
+  modalBox: { backgroundColor: THEME.surface, borderRadius: 14, padding: 16, borderWidth: 1, borderColor: THEME.secondary },
   modalTitle: { fontSize: 18, fontWeight: '800', marginBottom: 12, color: THEME.primary },
   label: { fontSize: 13, fontWeight: '700', color: THEME.primary, marginBottom: 6 },
   input: { borderWidth: 1, borderColor: THEME.secondary, borderRadius: 8, padding: 10, marginBottom: 10, fontSize: 14, backgroundColor: THEME.background, color: THEME.primary },
